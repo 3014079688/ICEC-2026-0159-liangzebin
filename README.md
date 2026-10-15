@@ -1,7 +1,7 @@
 # ICEC-2026 挑战赛 · 过程记录仓库
 
 > **学号**：2025XXXXXX（后四位 **0159**） ｜ **姓名拼音**：**liangzebin**
-> **仓库地址**：https://github.com/<你的GitHub用户名>/ICEC-2026-0159-liangzebin
+> **仓库地址**：https://github.com/3014079688/ICEC-2026-0159-liangzebin
 
 ---
 
@@ -64,4 +64,4 @@ ICEC-2026-0159-liangzebin/
 
 | 日期 | 更新内容 |
 | --- | --- |
-| 2026-10-15 | 初始化仓库，搭建标准目录结构 |
+| 2026-10-15 | 初始化仓库，搭建标准目录结构，推送至 https://github.com/3014079688/ICEC-2026-0159-liangzebin |

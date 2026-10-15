@@ -1,0 +1,39 @@
+# ---- 系统文件 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 编辑器 / IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# ---- Node ----
+node_modules/
+dist/
+build/
+*.log
+
+# ---- 大文件（单文件 > 50MB 请勿直接提交，改用 Git LFS 或放网盘并在 README 里附链接）----
+*.zip
+*.7z
+*.rar
+*.mp4
+*.mov
+*.psd
+*.iso
+
+# ---- 敏感信息（务必不要提交！）----
+.env
+*.key
+*.pem
+secrets.json

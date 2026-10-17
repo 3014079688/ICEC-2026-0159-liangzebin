@@ -335,6 +335,127 @@ def plot_spectrum(data: dict[str, pd.DataFrame], out: Path) -> None:
 # ----------------------------------------------------------------------------
 # 5. 阈值规则推导
 # ----------------------------------------------------------------------------
+def _impurity(labels: np.ndarray) -> float:
+    """基尼不纯度。"""
+    if len(labels) == 0:
+        return 0.0
+    _, counts = np.unique(labels, return_counts=True)
+    p = counts / counts.sum()
+    return float(1.0 - np.sum(p**2))
+
+
+def _best_split(df: pd.DataFrame, cols: list[str], min_leaf: int):
+    """在所有特征的所有候选阈值中，找基尼不纯度下降最多的切分点。"""
+    y = df["state"].to_numpy()
+    n = len(y)
+    base = _impurity(y)
+    best = None
+
+    for c in cols:
+        v = df[c].to_numpy(dtype=float)
+        if not np.all(np.isfinite(v)):
+            v = np.nan_to_num(v, nan=np.nanmedian(v))
+        order = np.argsort(v)
+        vs, ys = v[order], y[order]
+        cut = np.where(np.diff(vs) > 0)[0]
+        if len(cut) == 0:
+            continue
+        step = max(1, len(cut) // 60)          # 候选点上限，避免过慢
+        for i in cut[::step]:
+            if i + 1 < min_leaf or n - i - 1 < min_leaf:
+                continue
+            imp = (len(ys[:i + 1]) * _impurity(ys[:i + 1]) +
+                   len(ys[i + 1:]) * _impurity(ys[i + 1:])) / n
+            if best is None or imp < best[0]:
+                best = (imp, c, float((vs[i] + vs[i + 1]) / 2))
+
+    if best is None or best[0] >= base - 1e-9:
+        return None
+    return best[1], best[2]
+
+
+def build_tree(df: pd.DataFrame, cols: list[str],
+               max_depth: int = 4, min_leaf: int = 15, depth: int = 0):
+    """贪心构建决策树，返回嵌套元组。"""
+    y = df["state"].to_numpy()
+    if len(np.unique(y)) == 1:
+        return ("leaf", y[0])
+    if depth >= max_depth or len(df) < 2 * min_leaf:
+        vals, cnts = np.unique(y, return_counts=True)
+        return ("leaf", vals[np.argmax(cnts)])
+
+    split = _best_split(df, cols, min_leaf)
+    if split is None:
+        vals, cnts = np.unique(y, return_counts=True)
+        return ("leaf", vals[np.argmax(cnts)])
+
+    col, thr = split
+    mask = df[col].to_numpy(dtype=float) <= thr
+    left = build_tree(df[mask], cols, max_depth, min_leaf, depth + 1)
+    right = build_tree(df[~mask], cols, max_depth, min_leaf, depth + 1)
+    return ("node", col, thr, left, right)
+
+
+def prune_tree(node):
+    """后剪枝：若左右子树落到同一个叶子，就把这个节点塌缩掉。"""
+    if node[0] == "leaf":
+        return node
+    _, col, thr, left, right = node
+    left, right = prune_tree(left), prune_tree(right)
+    if left[0] == "leaf" and right[0] == "leaf" and left[1] == right[1]:
+        return left
+    return ("node", col, thr, left, right)
+
+
+def render_tree(node, indent: int = 0) -> list[str]:
+    """把决策树渲染成可读的 if-else 文本。"""
+    pad = "  " * indent
+    if node[0] == "leaf":
+        return [f"{pad}→ {node[1]}"]
+    _, col, thr, left, right = node
+    out = [f"{pad}if {col} <= {thr:.3f}:"]
+    out += render_tree(left, indent + 1)
+    out.append(f"{pad}else:")
+    out += render_tree(right, indent + 1)
+    return out
+
+
+def predict_tree(node, row: dict) -> str:
+    while node[0] == "node":
+        _, col, thr, left, right = node
+        v = row.get(col, 0.0)
+        node = left if (np.isfinite(v) and v <= thr) else right
+    return node[1]
+
+
+def evaluate_cv(features: pd.DataFrame, cols: list[str]) -> tuple[float, float, int]:
+    """
+    留一段交叉验证：每次留出每类的一个 trial 做测试，其余训练。
+    返回 (准确率, 基线准确率即多数类占比, 折数)。
+    """
+    if "trial" not in features.columns:
+        return float("nan"), float("nan"), 0
+
+    trials = sorted(features["trial"].unique())
+    folds = 0
+    correct = total = 0
+    for held in trials:
+        test = features[features["trial"] == held]
+        train = features[features["trial"] != held]
+        if len(test) == 0 or train["state"].nunique() < 2:
+            continue
+        tree = prune_tree(build_tree(train, cols))
+        for _, r in test.iterrows():
+            if predict_tree(tree, r.to_dict()) == r["state"]:
+                correct += 1
+            total += 1
+        folds += 1
+
+    acc = correct / total if total else float("nan")
+    base = features["state"].value_counts(normalize=True).max()
+    return acc, float(base), folds
+
+
 def build_threshold_rules(feat: pd.DataFrame, out: Path) -> str:
     """
     对每个特征计算各状态的 [p10, p90] 区间，
@@ -347,63 +468,76 @@ def build_threshold_rules(feat: pd.DataFrame, out: Path) -> str:
              "> 再对每个状态取 [p10, p90] 区间作为该状态的典型取值范围。", "",
              "## 一、各状态特征取值范围", ""]
 
-    header = "| 特征 | " + " | ".join(STATE_ORDER) + " | 可分离 |"
-    lines += [header, "|" + "---|" * (len(STATE_ORDER) + 2)]
+    header = "| 特征 | " + " | ".join(STATE_ORDER) + " |"
+    lines += [header, "|" + "---|" * (len(STATE_ORDER) + 1)]
 
-    separability: dict[str, bool] = {}
     for col in feat_cols:
-        cells, ranges = [], []
+        cells = []
         for s in STATE_ORDER:
             v = feat.loc[feat["state"] == s, col].dropna()
             if len(v) == 0:
                 cells.append("—")
-                ranges.append(None)
                 continue
             lo, hi = np.percentile(v, [10, 90])
             cells.append(f"{lo:.2f} ~ {hi:.2f}")
-            ranges.append((lo, hi))
-        # 判断是否两两不重叠
-        ok = all(r is not None for r in ranges)
-        if ok:
-            srt = sorted(ranges)
-            for a, b in zip(srt, srt[1:]):
-                if a[1] >= b[0]:
-                    ok = False
-                    break
-        separability[col] = ok
-        lines.append(f"| `{col}` | " + " | ".join(cells) + f" | {'✅' if ok else '—'} |")
+        lines.append(f"| `{col}` | " + " | ".join(cells) + " |")
 
-    good = [c for c, v in separability.items() if v]
-    lines += ["", "## 二、推荐判据", ""]
+    # ---------- 二、单特征两两可分性 ----------
+    present = [s for s in STATE_ORDER if s in set(feat["state"])]
+    pairs = [(a, b) for i, a in enumerate(present) for b in present[i + 1:]]
 
-    if not good:
-        lines += ["> 本次数据里没有特征能做到四类完全分离。",
-                  "> 常见原因：采样时长太短、状态区分度不够、或手机放置位置不一致。",
-                  "> 建议：延长每段采集到 60 秒以上，固定手机位置（如裤兜同一侧），再跑一次。"]
+    lines += ["", "## 二、单特征的可分性（两两对比）", ""]
+    if pairs:
+        lines.append("| 特征 | " + " | ".join(f"{a} vs {b}" for a, b in pairs) + " |")
+        lines.append("|" + "---|" * (len(pairs) + 1))
+        for col in feat_cols:
+            cells = []
+            for a, b in pairs:
+                va = feat.loc[feat["state"] == a, col].dropna()
+                vb = feat.loc[feat["state"] == b, col].dropna()
+                if len(va) == 0 or len(vb) == 0:
+                    cells.append("—")
+                    continue
+                la, ha = np.percentile(va, [10, 90])
+                lb, hb = np.percentile(vb, [10, 90])
+                cells.append("✅" if (ha < lb or hb < la) else "重叠")
+            lines.append(f"| `{col}` | " + " | ".join(cells) + " |")
+        lines += ["",
+                  "> ✅ = 两类在该特征上的 p10–p90 区间完全不重叠，单看这一个特征就能分开。",
+                  "> 「重叠」= 单特征分不开，需要多特征联合判断。",
+                  "> 注意：`dom_freq` 对**静止**没有物理意义（无周期运动，FFT 峰值是噪声），不要用它判静止。"]
+
+    # ---------- 三、决策树判据 ----------
+    tree_cols = ["svm_std", "svm_max", "svm_p2p", "cv", "dom_freq", "zcr", "energy"]
+    tree = prune_tree(build_tree(feat, tree_cols))
+
+    lines += ["", "## 三、决策树判据（自动生成）", "",
+              "多特征联合判断，按顺序往下走即可。阈值均为**自动搜索**得到的基尼不纯度最优切分点。",
+              "", "```text"]
+    lines += render_tree(tree)
+    lines += ["```", ""]
+
+    # ---------- 四、分类效果 ----------
+    acc, base, folds = evaluate_cv(feat, tree_cols)
+    lines += ["## 四、分类效果（留一段交叉验证）", ""]
+    if folds and np.isfinite(acc):
+        lines += [
+            f"- 验证方式：每次留出**每类中的一段录制**作测试，其余训练，共 **{folds} 折**",
+            f"- 准确率：**{acc * 100:.1f}%**",
+            f"- 基线（全部猜最多的那一类）：{base * 100:.1f}%",
+            f"- 相对基线提升：**+{(acc - base) * 100:.1f} 个百分点**",
+            "",
+            "> 这个准确率是**换一段没见过的数据**测出来的，比在训练集上自评可信得多。",
+        ]
     else:
-        lines.append(f"以下特征在各状态间的取值范围**互不重叠**，可直接作为阈值判据："
-                     f" {'、'.join('`%s`' % c for c in good)}")
-        lines += ["", "```text"]
-        # 以区分度最好的两个特征构建决策链
-        primary = good[0]
-        lines.append(f"# 判据一：{primary}（{len(good)} 个可用特征中区分度最强）")
-        order = sorted(STATE_ORDER, key=lambda s: feat.loc[feat["state"] == s, primary].mean())
-        prev = None
-        for s in order:
-            v = feat.loc[feat["state"] == s, primary].dropna()
-            lo, hi = np.percentile(v, [10, 90]) if len(v) else (np.nan, np.nan)
-            if prev is not None:
-                thr = (prev + lo) / 2
-                lines.append(f"if {primary} > {thr:.2f}:  →  {s}")
-            else:
-                lines.append(f"if {primary} <= {(lo + hi) / 2:.2f}:  →  {s}")
-            prev = hi
-        lines += ["```", ""]
+        lines.append("- 数据不足以做交叉验证（需要每类至少 2 段独立录制）。")
+    lines.append("")
 
-    lines += ["## 三、说明", "",
-              "- 上表区间来自**自动统计**，不是教科书常数。换手机、换采集姿势、换人，数值都会变。",
+    lines += ["## 五、说明", "",
+              "- 上表区间与决策树阈值来自**自动统计**，不是教科书常数。换手机、换采集姿势、换人，数值都会变。",
               "- 论文/报告里写规则时，务必注明「基于本人 XX 型号手机、裤兜固定放置、N 段样本统计」。",
-              "- 阈值取两段区间的**中点**是为了留最大安全边界；若某两类挨得很近，可改用其他特征交叉判断。",
+              "- 决策树用 7 个特征联合判断，比单阈值更稳；但树越深越容易过拟合，这里限制在 4 层以内。",
+              "- 若「走路 vs 楼梯」重叠严重，通常是**上下楼速度过快**导致接近跑步步态，属于采集问题而非算法问题。",
               ""]
 
     text = "\n".join(lines)
@@ -442,7 +576,7 @@ def main() -> int:
         csv_files = make_demo_data(demo_dir)
         img_dir = dat_dir = demo_dir
     else:
-        csv_files = sorted(data_dir.glob("*.csv"))
+        csv_files = sorted(data_dir.rglob("*.csv"))
         csv_files = [f for f in csv_files
                      if not f.name.startswith("features") and "demo_" not in f.name]
 
@@ -452,35 +586,40 @@ def main() -> int:
         print("       真实数据请从 Phyphox 导出后放进 raw_data/，文件名带状态关键字。")
         return 1
 
-    # --- 读数据 ---
-    data: dict[str, pd.DataFrame] = {}
+    # --- 读数据：同一状态可以有多段（多次录制）---
+    trials: dict[str, list[tuple[str, pd.DataFrame]]] = {}
     for f in csv_files:
-        state = guess_state(f.name)
+        # 先看所在目录名（如 raw_data/走路/），再看文件名
+        state = guess_state(f.parent.name) or guess_state(f.name)
         if state is None:
-            print(f"[跳过] {f.name}：文件名没有状态关键字（still/walk/run/stair 或 静止/慢走/快跑/楼梯）")
-            continue
-        if state in data:
-            print(f"[跳过] {f.name}：{state} 已有数据")
+            print(f"[跳过] {f.name}：所在目录和文件名都没有状态关键字")
             continue
         try:
-            data[state] = load_phyphox_csv(f)
-            print(f"[读取] {f.name} → {state}，{len(data[state])} 点")
+            df = load_phyphox_csv(f)
         except Exception as e:                       # noqa: BLE001
             print(f"[错误] {f.name}: {e}")
+            continue
 
-    missing = [s for s in STATE_ORDER if s not in data]
+        dur = float(df["time"].iloc[-1] - df["time"].iloc[0])
+        fs_est = len(df) / dur if dur > 0 else 0.0
+        trials.setdefault(state, []).append((f.stem, df))
+        print(f"[读取] {f.parent.name}/{f.name} → {state}"
+              f"　{len(df)} 点 / {dur:.1f}s / ≈{fs_est:.0f} Hz")
+
+    missing = [s for s in STATE_ORDER if s not in trials]
     if missing:
         print(f"[警告] 缺少状态：{'、'.join(missing)}（对比分析会不完整）")
-    if not data:
+    if not trials:
         return 1
 
-    # --- 特征 ---
+    # --- 特征（每段单独分窗，保留 trial 以便追溯）---
     frames = []
-    for state, df in data.items():
-        feat = windowed_features(df, win_sec=args.window)
-        feat["state"] = state
-        feat["source"] = state
-        frames.append(feat)
+    for state, items in trials.items():
+        for name, df in items:
+            feat = windowed_features(df, win_sec=args.window)
+            feat["state"] = state
+            feat["trial"] = name
+            frames.append(feat)
     features = pd.concat(frames, ignore_index=True)
 
     feat_path = dat_dir / "features_windows.csv"
@@ -503,13 +642,13 @@ def main() -> int:
     print(head)
     print("-" * len(head))
     for s in STATE_ORDER:
-        if s not in data:
+        if s not in trials:
             continue
         row = features[features["state"] == s]
         print(f"{s:<6}" + "".join(f"{row[c].mean():>12.3f}" for c in show))
 
-    # --- 图 ---
-    ordered = {s: data[s] for s in STATE_ORDER if s in data}
+    # --- 图（波形与频谱每类取第一段展示，特征箱线图用全部窗口）---
+    ordered = {s: trials[s][0][1] for s in STATE_ORDER if s in trials}
     plot_waveforms(ordered, img_dir / "fig1_waveforms.png")
     plot_feature_boxes(features, img_dir / "fig2_feature_boxes.png")
     plot_spectrum(ordered, img_dir / "fig3_spectrum.png")

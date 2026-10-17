@@ -54,7 +54,7 @@ ICEC-2026-0159-liangzebin/
 
 | 阶段 | 内容 | 状态 | 最近更新 |
 | --- | --- | --- | --- |
-| 阶段一 | Field Discovery | ✅ 已完成 | 2026-10-17 |
+| 阶段一 | Field Discovery | 🟨 进行中（2 个课题，已完成 1 个） | 2026-10-18 |
 | 阶段二 | 20 Days Challenge | ⬜ 未开始 | — |
 | 阶段三 | AI Collaboration | ⬜ 未开始 | — |
 
